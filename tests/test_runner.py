@@ -126,6 +126,53 @@ workers = [1, 2, 4]
     assert suite.result_directory == Path("measurements")
     assert [config.workers for config in suite.benchmarks] == [1, 2, 4]
     assert {config.graph_depth for config in suite.benchmarks} == {1}
+    assert {config.scaling for config in suite.benchmarks} == {"strong"}
+
+
+def test_weak_scaling_expands_per_worker_workload(tmp_path: Path) -> None:
+    path = tmp_path / "weak.toml"
+    path.write_text(
+        """
+schema_version = 1
+
+[defaults]
+backend = "thread"
+task_kind = "sleep"
+task_duration = 0.0
+components = 32
+evaluations = 2
+batch_size = 1
+workers = [1, 2, 4]
+repeats = 2
+warmup_evaluations = 0
+scaling = "weak"
+
+[[benchmark]]
+name = "weak-scaling"
+""",
+        encoding="utf-8",
+    )
+
+    configs = runner.load_config(path).benchmarks
+
+    assert [config.workers for config in configs] == [1, 2, 4]
+    assert [config.evaluations for config in configs] == [2, 4, 8]
+    assert [config.batch_size for config in configs] == [1, 2, 4]
+    assert all(config.scaling == "weak" for config in configs)
+    assert all(runner._reference_config(config).evaluations == 2 for config in configs)
+    assert all(runner._reference_config(config).batch_size == 1 for config in configs)
+
+
+def test_weak_scaling_rejects_uncoupled_workload() -> None:
+    config = make_config(
+        scaling="weak",
+        workers=3,
+        evaluations=4,
+        batch_size=3,
+    )
+
+    with pytest.raises(ValueError, match="divisible by workers"):
+        config.validate()
 
 
 @pytest.mark.parametrize(
@@ -172,3 +219,32 @@ def test_json_result_contains_raw_samples_and_is_exclusively_created(
     assert stored["configuration"]["components"] == 3
     assert stored["configuration"]["graph_depth"] == 1
     assert stored["software"]["chemfit_git"]["commit"]
+
+
+def test_weak_scaling_result_has_weak_efficiency() -> None:
+    config = make_config(
+        scaling="weak",
+        workers=4,
+        evaluations=8,
+        batch_size=8,
+    )
+    target = {
+        "median_seconds": 1.25,
+        "evaluations_per_second": 8 / 1.25,
+        "objective_terms_per_second": 24 / 1.25,
+    }
+    baseline = {
+        "median_seconds": 1.0,
+        "evaluations_per_second": 2.0,
+        "objective_terms_per_second": 6.0,
+    }
+
+    result = runner.build_result(config, target, baseline)
+
+    assert result["metrics"]["weak_scaling_efficiency"] == pytest.approx(0.8)
+    assert "speedup" not in result["metrics"]
+    assert "parallel_efficiency" not in result["metrics"]
+    reference = result["single_worker_reference_configuration"]
+    assert reference["workers"] == 1
+    assert reference["evaluations"] == 2
+    assert reference["batch_size"] == 2

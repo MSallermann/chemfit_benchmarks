@@ -15,6 +15,7 @@ warm-up, and every measured repetition.
 The included configurations cover:
 
 - strong scaling with fixed useful work;
+- weak scaling with fixed useful work per worker;
 - throughput from many concurrent evaluations;
 - overhead for inexpensive tasks;
 - independent objective terms versus batches of top-level evaluations;
@@ -77,7 +78,8 @@ benchmark field can be either a single value or a list, whether it appears in
 `[defaults]` or a `[[benchmark]]` table. This includes `name`, `backend`,
 `task_kind`, `task_duration`, `components`, `graph_depth`, `evaluations`,
 `batch_size`, `workers`, `repeats`, and `warmup_evaluations`. A list creates a
-Cartesian sweep; a single value stays fixed. The top-level `schema_version`
+Cartesian sweep; a single value stays fixed. `scaling` may be `strong` or
+`weak` and defaults to `strong`. The top-level `schema_version`
 and `result_directory` fields must be single values. Command-line arguments
 are also single-valued, so use a TOML file for sweeps:
 
@@ -117,6 +119,7 @@ The configuration fields have deliberately narrow meanings:
 | `task_kind` | `sleep` for concurrency studies or `busy` for a Python CPU loop. |
 | `warmup_evaluations` | Untimed evaluations after first use and before samples are collected. |
 | `repeats` | Number of raw timing samples retained in the JSON result. |
+| `scaling` | `strong` keeps the configured workload fixed. `weak` treats `evaluations` and `batch_size` as per-worker values and scales both by `workers`. |
 
 Lists are expanded independently. For example, four worker counts and three
 depths produce twelve configurations. There is no pairing or zip behavior.
@@ -153,6 +156,32 @@ Use runtime, speedup, and parallel efficiency to answer whether adding workers
 reduces time for the same workload. The workload contains 1,024 atomic term
 executions per sample, so it offers concurrency both within objectives and
 across evaluations.
+
+### Weak scaling
+
+`weak-scaling` in [config/local.toml](config/local.toml) and
+`mpi-weak-scaling` in [config/mpi.toml](config/mpi.toml) hold useful work per
+worker constant. They configure one evaluation per worker, with 32 independent
+terms in each evaluation, so every worker receives 32 atomic terms. The cases
+cover 10 ms and 100 ms terms.
+
+Weak mode couples workload to worker count rather than taking a Cartesian
+product. In this example:
+
+```toml
+[[benchmark]]
+name = "weak-scaling"
+scaling = "weak"
+workers = [1, 2, 4, 8]
+evaluations = 1
+batch_size = 1
+```
+
+the expanded configurations contain 1, 2, 4, and 8 evaluations respectively.
+The JSON records these expanded totals and also records the reduced one-worker
+reference configuration. Weak-scaling efficiency is calculated as
+`one_worker_runtime / target_runtime`; ideal weak scaling therefore remains at
+1.0 as workers and total work increase together.
 
 ### Throughput across task durations
 
@@ -291,6 +320,8 @@ python benchmark/chemfit_runner.py \
 Choose parameters according to the question being asked:
 
 - For strong scaling, hold everything except `workers` fixed.
+- For weak scaling, set `scaling="weak"`; `evaluations` and `batch_size` then
+  specify one worker's share and grow with `workers`.
 - To study increasing depth, hold `components` fixed and vary `graph_depth`.
   Total work grows with depth, so compare objective-term throughput as well as
   raw runtime.
@@ -342,13 +373,17 @@ replaced. Each record contains:
 
 - the complete configuration and worker count;
 - every timing sample, median, median absolute deviation, and throughput;
-- a matching one-worker reference, speedup, and parallel efficiency;
+- a matching one-worker reference and its configuration;
+- speedup and parallel efficiency for strong mode, or weak-scaling efficiency
+  for weak mode;
 - the ChemFit version and Git commit, including dirty-tree state;
 - Python, host, operating-system, CPU-count, and available Slurm metadata.
 
 For multi-worker configurations, the runner measures a matching one-worker
-reference in the same invocation. Scheduler construction and schedule
-preparation are recorded as measured startup overhead. The separately named
+reference in the same invocation. A strong reference runs the complete fixed
+workload, while a weak reference runs one worker's share. Scheduler
+construction and schedule preparation are recorded as measured startup
+overhead. The separately named
 `first_evaluation_seconds` includes useful task time and any lazy worker
 initialization; it is deliberately not described as pure worker startup.
 
@@ -397,6 +432,7 @@ The script recursively reads JSON files and writes PNG and PDF versions of:
 - runtime versus worker count, with timing MAD error bars;
 - speedup versus worker count, with ideal linear scaling;
 - parallel efficiency versus worker count;
+- weak-scaling efficiency versus worker count, when weak results are present;
 - evaluation throughput versus atomic task duration.
 
 Results with the same configuration, ChemFit commit, and x coordinate are

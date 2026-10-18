@@ -27,15 +27,30 @@ def load_results(directory: Path) -> list[dict[str, Any]]:
 def _series_label(result: dict[str, Any], x_field: str) -> str:
     config = result["configuration"]
     commit = result.get("software", {}).get("chemfit_git", {}).get("commit")
+    scaling = config.get("scaling", "strong")
     parts = [
         config["name"],
         config["backend"],
         config["task_kind"],
         f"terms={config['components']}",
         f"depth={config.get('graph_depth', 1)}",
-        f"evals={config['evaluations']}",
-        f"batch={config['batch_size']}",
     ]
+    if scaling == "weak" and x_field == "workers":
+        workers = config["workers"]
+        parts.extend(
+            (
+                "weak scaling",
+                f"evals/worker={config['evaluations'] // workers}",
+                f"batch/worker={config['batch_size'] // workers}",
+            )
+        )
+    else:
+        parts.extend(
+            (
+                f"evals={config['evaluations']}",
+                f"batch={config['batch_size']}",
+            )
+        )
     if x_field != "workers":
         parts.append(f"workers={config['workers']}")
     if x_field != "task_duration":
@@ -58,10 +73,14 @@ def _plot(
 ) -> None:
     import matplotlib.pyplot as plt
 
+    metric_results = [result for result in results if metric in result["metrics"]]
+    if not metric_results:
+        return
+
     grouped: dict[str, dict[float, list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    for result in results:
+    for result in metric_results:
         config = result["configuration"]
         grouped[_series_label(result, x_field)][float(config[x_field])].append(result)
 
@@ -81,7 +100,7 @@ def _plot(
         else:
             ax.plot(xs, ys, marker="o", label=label)
 
-    all_xs = [float(result["configuration"][x_field]) for result in results]
+    all_xs = [float(result["configuration"][x_field]) for result in metric_results]
     if ideal == "linear" and all_xs:
         # On a logarithmic x-axis, joining only the two endpoints would draw a
         # straight line in display coordinates rather than the function y=x.
@@ -94,7 +113,13 @@ def _plot(
 
     if x_field == "workers":
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("Worker count (MPI excludes coordinator rank 0)")
+        backends = {result["configuration"]["backend"] for result in metric_results}
+        if backends == {"mpi"}:
+            ax.set_xlabel("MPI workers (coordinator rank 0 excluded)")
+        elif backends == {"thread"}:
+            ax.set_xlabel("Worker threads")
+        else:
+            ax.set_xlabel("Worker count")
     else:
         if all(value > 0 for value in all_xs):
             ax.set_xscale("log")
@@ -139,6 +164,15 @@ def make_plots(results: list[dict[str, Any]], output: Path) -> None:
         x_field="workers",
         metric="parallel_efficiency",
         ylabel="Parallel efficiency",
+        ideal="unity",
+    )
+    _plot(
+        results,
+        output,
+        filename="weak_scaling_efficiency_vs_workers.png",
+        x_field="workers",
+        metric="weak_scaling_efficiency",
+        ylabel="Weak-scaling efficiency",
         ideal="unity",
     )
     _plot(

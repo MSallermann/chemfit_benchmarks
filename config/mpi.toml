@@ -16,6 +16,15 @@ graph_depth = 1
 [[benchmark]]
 name = "mpi-strong-scaling"
 
+# Keep 32 atomic terms per worker while the worker count grows. Rank 0 remains
+# the coordinator and is not included in workers.
+[[benchmark]]
+name = "mpi-weak-scaling"
+scaling = "weak"
+evaluations = 1
+batch_size = 1
+task_duration = [0.01, 0.1]
+
 [[benchmark]]
 name = "mpi-throughput"
 components = 1

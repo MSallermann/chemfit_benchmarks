@@ -17,6 +17,16 @@ graph_depth = 1
 [[benchmark]]
 name = "strong-scaling"
 
+# Keep 32 atomic terms per worker while the worker count grows. In weak mode,
+# evaluations and batch_size are per-worker values and are expanded together
+# with workers.
+[[benchmark]]
+name = "weak-scaling"
+scaling = "weak"
+evaluations = 1
+batch_size = 1
+task_duration = [0.01, 0.1]
+
 # Many concurrent top-level evaluations, across several task costs.
 [[benchmark]]
 name = "throughput"

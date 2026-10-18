@@ -46,6 +46,7 @@ class BenchmarkConfig:
     repeats: int
     warmup_evaluations: int
     graph_depth: int = 1
+    scaling: str = "strong"
 
     def validate(self) -> None:
         if not self.name:
@@ -54,6 +55,8 @@ class BenchmarkConfig:
             raise ValueError(f"unknown backend {self.backend!r}")
         if self.task_kind not in {"sleep", "busy"}:
             raise ValueError("task kind must be 'sleep' or 'busy'")
+        if self.scaling not in {"strong", "weak"}:
+            raise ValueError("scaling must be 'strong' or 'weak'")
         if self.task_duration < 0:
             raise ValueError("task duration cannot be negative")
         for field_name in ("components", "evaluations", "batch_size", "workers", "repeats"):
@@ -63,6 +66,10 @@ class BenchmarkConfig:
             raise ValueError("warmup_evaluations cannot be negative")
         if self.graph_depth < 1:
             raise ValueError("graph_depth must be positive")
+        if self.scaling == "weak" and (
+            self.evaluations % self.workers or self.batch_size % self.workers
+        ):
+            raise ValueError("weak-scaling evaluations and batch size must be divisible by workers")
         if self.backend in {"direct", "serial"} and self.workers != 1:
             raise ValueError(f"{self.backend} has exactly one worker")
 
@@ -262,7 +269,15 @@ def _run_mpi_communicator(config: BenchmarkConfig, comm: Any) -> dict[str, Any] 
     return result
 
 
-def _single_worker_config(config: BenchmarkConfig) -> BenchmarkConfig:
+def _reference_config(config: BenchmarkConfig) -> BenchmarkConfig:
+    """Return the one-worker workload appropriate for the scaling mode."""
+    if config.scaling == "weak":
+        return replace(
+            config,
+            workers=1,
+            evaluations=config.evaluations // config.workers,
+            batch_size=config.batch_size // config.workers,
+        )
     return replace(config, workers=1)
 
 
@@ -271,7 +286,7 @@ def run(config: BenchmarkConfig) -> tuple[dict[str, Any] | None, dict[str, Any] 
     config.validate()
     if config.backend != "mpi":
         target = _run_local(config)
-        baseline = target if config.workers == 1 else _run_local(_single_worker_config(config))
+        baseline = target if config.workers == 1 else _run_local(_reference_config(config))
         return target, baseline
 
     from mpi4py import MPI
@@ -300,7 +315,7 @@ def run(config: BenchmarkConfig) -> tuple[dict[str, Any] | None, dict[str, Any] 
             )
             if baseline_comm != MPI.COMM_NULL:
                 baseline = _run_mpi_communicator(
-                    _single_worker_config(config), baseline_comm
+                    _reference_config(config), baseline_comm
                 )
                 baseline_comm.Free()
             active_comm.Barrier()
@@ -399,7 +414,13 @@ def _expand_benchmark(defaults: dict[str, Any], table: dict[str, Any]) -> list[B
 
     expanded: list[BenchmarkConfig] = []
     for combination in itertools.product(*axes):
-        config = BenchmarkConfig(**dict(zip(names, combination, strict=True)))
+        config_values = dict(zip(names, combination, strict=True))
+        if config_values["scaling"] == "weak":
+            # Weak-scaling TOML values describe one worker's share. Store the
+            # expanded totals in BenchmarkConfig and therefore in result JSON.
+            config_values["evaluations"] *= config_values["workers"]
+            config_values["batch_size"] *= config_values["workers"]
+        config = BenchmarkConfig(**config_values)
         config.validate()
         expanded.append(config)
     return expanded
@@ -414,7 +435,11 @@ def load_config(path: Path) -> SuiteConfig:
         raise ValueError(f"unknown top-level TOML keys: {sorted(unknown)}")
     if document.get("schema_version", 1) != 1:
         raise ValueError("only configuration schema_version = 1 is supported")
-    defaults = {"graph_depth": 1, **document.get("defaults", {})}
+    defaults = {
+        "graph_depth": 1,
+        "scaling": "strong",
+        **document.get("defaults", {}),
+    }
     unknown_defaults = set(defaults) - _CONFIG_FIELDS
     if unknown_defaults:
         raise ValueError(f"unknown default keys: {sorted(unknown_defaults)}")
@@ -437,7 +462,18 @@ def build_result(
     target: dict[str, Any],
     baseline: dict[str, Any],
 ) -> dict[str, Any]:
-    speedup = baseline["median_seconds"] / target["median_seconds"]
+    runtime_ratio = baseline["median_seconds"] / target["median_seconds"]
+    metrics = {
+        "median_runtime_seconds": target["median_seconds"],
+        "throughput_evaluations_per_second": target["evaluations_per_second"],
+        "throughput_objective_terms_per_second": target["objective_terms_per_second"],
+    }
+    if config.scaling == "weak":
+        metrics["weak_scaling_efficiency"] = runtime_ratio
+    else:
+        metrics["speedup"] = runtime_ratio
+        metrics["parallel_efficiency"] = runtime_ratio / config.workers
+
     return {
         "schema_version": 1,
         "run_id": uuid.uuid4().hex,
@@ -446,15 +482,8 @@ def build_result(
         "worker_count": config.workers,
         "timings": target,
         "single_worker_reference": baseline,
-        "metrics": {
-            "median_runtime_seconds": target["median_seconds"],
-            "throughput_evaluations_per_second": target["evaluations_per_second"],
-            "throughput_objective_terms_per_second": target[
-                "objective_terms_per_second"
-            ],
-            "speedup": speedup,
-            "parallel_efficiency": speedup / config.workers,
-        },
+        "single_worker_reference_configuration": asdict(_reference_config(config)),
+        "metrics": metrics,
         **metadata(),
     }
 
@@ -496,6 +525,7 @@ def _parse_args() -> tuple[list[BenchmarkConfig], Path]:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--warmup-evaluations", type=int, default=2)
     parser.add_argument("--graph-depth", type=int)
+    parser.add_argument("--scaling", choices=("strong", "weak"))
     args = parser.parse_args()
 
     direct_names = (
@@ -507,6 +537,7 @@ def _parse_args() -> tuple[list[BenchmarkConfig], Path]:
         "batch_size",
         "workers",
         "graph_depth",
+        "scaling",
     )
     supplied_directly = any(getattr(args, name) is not None for name in direct_names)
     if args.config:
@@ -515,22 +546,31 @@ def _parse_args() -> tuple[list[BenchmarkConfig], Path]:
         suite = load_config(args.config)
         return suite.benchmarks, args.results_dir or suite.result_directory
 
-    required_direct_names = tuple(name for name in direct_names if name != "graph_depth")
+    required_direct_names = tuple(
+        name for name in direct_names if name not in {"graph_depth", "scaling"}
+    )
     missing = [name for name in required_direct_names if getattr(args, name) is None]
     if missing:
         parser.error("without --config these arguments are required: " + ", ".join(missing))
+    config_values = {
+        "name": args.name,
+        "backend": args.backend,
+        "task_kind": args.task_kind,
+        "task_duration": args.task_duration,
+        "components": args.components,
+        "evaluations": args.evaluations,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "repeats": args.repeats,
+        "warmup_evaluations": args.warmup_evaluations,
+        "graph_depth": 1 if args.graph_depth is None else args.graph_depth,
+        "scaling": "strong" if args.scaling is None else args.scaling,
+    }
+    if config_values["scaling"] == "weak":
+        config_values["evaluations"] *= config_values["workers"]
+        config_values["batch_size"] *= config_values["workers"]
     config = BenchmarkConfig(
-        name=args.name,
-        backend=args.backend,
-        task_kind=args.task_kind,
-        task_duration=args.task_duration,
-        components=args.components,
-        evaluations=args.evaluations,
-        batch_size=args.batch_size,
-        workers=args.workers,
-        repeats=args.repeats,
-        warmup_evaluations=args.warmup_evaluations,
-        graph_depth=1 if args.graph_depth is None else args.graph_depth,
+        **config_values,
     )
     config.validate()
     return [config], args.results_dir or Path("results")
