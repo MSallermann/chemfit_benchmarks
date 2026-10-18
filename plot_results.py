@@ -83,8 +83,12 @@ def _plot(
 
     all_xs = [float(result["configuration"][x_field]) for result in results]
     if ideal == "linear" and all_xs:
-        lower, upper = min(all_xs), max(all_xs)
-        ax.plot([lower, upper], [lower, upper], "k--", linewidth=1, label="ideal")
+        # On a logarithmic x-axis, joining only the two endpoints would draw a
+        # straight line in display coordinates rather than the function y=x.
+        # Include every observed x coordinate so the reference follows ideal
+        # linear speedup at each worker count.
+        ideal_xs = sorted(set(all_xs))
+        ax.plot(ideal_xs, ideal_xs, "k--", linewidth=1, label="ideal")
     elif ideal == "unity":
         ax.axhline(1.0, color="black", linestyle="--", linewidth=1, label="ideal")
 
