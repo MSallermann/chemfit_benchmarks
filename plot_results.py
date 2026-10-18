@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Create scientific figures from standalone ChemFit benchmark JSON files."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+
+def load_results(directory: Path) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for path in sorted(directory.rglob("*.json")):
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if result.get("schema_version") != 1:
+            raise ValueError(f"unsupported result schema in {path}")
+        if "configuration" not in result or "metrics" not in result:
+            raise ValueError(f"not a ChemFit benchmark result: {path}")
+        result["_path"] = str(path)
+        results.append(result)
+    return results
+
+
+def _series_label(result: dict[str, Any], x_field: str) -> str:
+    config = result["configuration"]
+    commit = result.get("software", {}).get("chemfit_git", {}).get("commit")
+    parts = [
+        config["name"],
+        config["backend"],
+        config["task_kind"],
+        f"terms={config['components']}",
+        f"depth={config.get('graph_depth', 1)}",
+        f"evals={config['evaluations']}",
+        f"batch={config['batch_size']}",
+    ]
+    if x_field != "workers":
+        parts.append(f"workers={config['workers']}")
+    if x_field != "task_duration":
+        parts.append(f"duration={config['task_duration']:g}s")
+    if commit:
+        parts.append(f"commit={commit[:8]}")
+    return ", ".join(parts)
+
+
+def _plot(
+    results: list[dict[str, Any]],
+    output: Path,
+    *,
+    filename: str,
+    x_field: str,
+    metric: str,
+    ylabel: str,
+    ideal: str | None = None,
+    runtime_errors: bool = False,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    grouped: dict[str, dict[float, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for result in results:
+        config = result["configuration"]
+        grouped[_series_label(result, x_field)][float(config[x_field])].append(result)
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8), constrained_layout=True)
+    for label, points in sorted(grouped.items()):
+        xs = sorted(points)
+        ys = [statistics.median(item["metrics"][metric] for item in points[x]) for x in xs]
+        if runtime_errors:
+            errors = [
+                statistics.median(
+                    item["timings"]["median_absolute_deviation_seconds"]
+                    for item in points[x]
+                )
+                for x in xs
+            ]
+            ax.errorbar(xs, ys, yerr=errors, marker="o", capsize=3, label=label)
+        else:
+            ax.plot(xs, ys, marker="o", label=label)
+
+    all_xs = [float(result["configuration"][x_field]) for result in results]
+    if ideal == "linear" and all_xs:
+        lower, upper = min(all_xs), max(all_xs)
+        ax.plot([lower, upper], [lower, upper], "k--", linewidth=1, label="ideal")
+    elif ideal == "unity":
+        ax.axhline(1.0, color="black", linestyle="--", linewidth=1, label="ideal")
+
+    if x_field == "workers":
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("Worker count (MPI excludes coordinator rank 0)")
+    else:
+        if all(value > 0 for value in all_xs):
+            ax.set_xscale("log")
+        else:
+            ax.set_xscale("symlog", linthresh=1e-6)
+        ax.set_xlabel("Atomic task duration (s)")
+    ax.set_ylabel(ylabel)
+    ax.grid(alpha=0.25)
+    if grouped:
+        ax.legend(fontsize="xx-small")
+    fig.savefig(output / filename, dpi=200)
+    fig.savefig(output / filename.replace(".png", ".pdf"))
+    plt.close(fig)
+
+
+def make_plots(results: list[dict[str, Any]], output: Path) -> None:
+    if not results:
+        raise ValueError("no JSON results found")
+    output.mkdir(parents=True, exist_ok=True)
+    _plot(
+        results,
+        output,
+        filename="runtime_vs_workers.png",
+        x_field="workers",
+        metric="median_runtime_seconds",
+        ylabel="Median runtime (s)",
+        runtime_errors=True,
+    )
+    _plot(
+        results,
+        output,
+        filename="speedup_vs_workers.png",
+        x_field="workers",
+        metric="speedup",
+        ylabel="Speedup",
+        ideal="linear",
+    )
+    _plot(
+        results,
+        output,
+        filename="efficiency_vs_workers.png",
+        x_field="workers",
+        metric="parallel_efficiency",
+        ylabel="Parallel efficiency",
+        ideal="unity",
+    )
+    _plot(
+        results,
+        output,
+        filename="throughput_vs_task_duration.png",
+        x_field="task_duration",
+        metric="throughput_evaluations_per_second",
+        ylabel="Complete objective evaluations / s",
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("results", type=Path, help="directory containing JSON results")
+    parser.add_argument("--output", type=Path, default=Path("plots"))
+    args = parser.parse_args()
+    results = load_results(args.results)
+    make_plots(results, args.output)
+    print(f"plotted {len(results)} result(s) in {args.output}")
+
+
+if __name__ == "__main__":
+    main()

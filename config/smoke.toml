@@ -1,0 +1,28 @@
+schema_version = 1
+result_directory = "results"
+
+[defaults]
+task_kind = "sleep"
+task_duration = 0.001
+components = 4
+evaluations = 4
+batch_size = 4
+repeats = 3
+warmup_evaluations = 1
+graph_depth = 1
+
+[[benchmark]]
+name = "smoke-baselines"
+backend = ["direct", "serial"]
+workers = 1
+
+[[benchmark]]
+name = "smoke-executor"
+backend = "thread"
+workers = [1, 2, 4]
+
+[[benchmark]]
+name = "smoke-deep-graph"
+backend = "thread"
+workers = 2
+graph_depth = 3

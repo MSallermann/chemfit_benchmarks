@@ -1,0 +1,56 @@
+schema_version = 1
+result_directory = "results"
+
+[defaults]
+backend = "thread"
+task_kind = "sleep"
+task_duration = 0.01
+components = 32
+evaluations = 32
+batch_size = 32
+workers = [1, 2, 4, 8]
+repeats = 5
+warmup_evaluations = 2
+graph_depth = 1
+
+# Fixed useful work while worker count changes.
+[[benchmark]]
+name = "strong-scaling"
+
+# Many concurrent top-level evaluations, across several task costs.
+[[benchmark]]
+name = "throughput"
+components = 1
+evaluations = 128
+batch_size = 128
+task_duration = [0.001, 0.01, 0.1]
+
+# Very inexpensive terms expose scheduler overhead.
+[[benchmark]]
+name = "scheduling-overhead"
+components = 1
+evaluations = 256
+batch_size = 256
+task_duration = [0.000001, 0.00001, 0.0001]
+
+# Equal numbers of atomic terms, exposed through the two parallelism axes.
+[[benchmark]]
+name = "independent-components"
+components = 32
+evaluations = 1
+batch_size = 1
+
+[[benchmark]]
+name = "batched-evaluations"
+components = 1
+evaluations = 32
+batch_size = 32
+
+# Repeated fan-out/fan-in levels exercise dependency release and frontier refill.
+[[benchmark]]
+name = "deep-layered-graph"
+components = 8
+graph_depth = [2, 4, 8]
+evaluations = 16
+batch_size = 16
+task_duration = 0.001

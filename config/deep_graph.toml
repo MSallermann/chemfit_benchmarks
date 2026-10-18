@@ -1,0 +1,26 @@
+schema_version = 1
+result_directory = "results/deep-graph"
+
+[defaults]
+backend = "thread"
+task_kind = "sleep"
+task_duration = 0.001
+components = 8
+graph_depth = [1, 2, 4, 8]
+workers = [1, 2, 4, 8]
+repeats = 5
+warmup_evaluations = 2
+
+# Isolate scheduling within one layered graph. At most `components` atomic
+# terms are ready at once, regardless of depth.
+[[benchmark]]
+name = "deep-single-evaluation"
+evaluations = 1
+batch_size = 1
+
+# Keep several graph instances in flight so the scheduler can draw ready work
+# from other evaluations while one instance crosses a layer boundary.
+[[benchmark]]
+name = "deep-batched-evaluations"
+evaluations = 16
+batch_size = 16

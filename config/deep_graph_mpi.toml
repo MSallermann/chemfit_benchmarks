@@ -1,0 +1,22 @@
+schema_version = 1
+result_directory = "results/deep-graph-mpi"
+
+[defaults]
+backend = "mpi"
+task_kind = "sleep"
+task_duration = 0.001
+components = 8
+graph_depth = [1, 2, 4, 8]
+workers = [1, 3, 7]
+repeats = 5
+warmup_evaluations = 2
+
+[[benchmark]]
+name = "mpi-deep-single-evaluation"
+evaluations = 1
+batch_size = 1
+
+[[benchmark]]
+name = "mpi-deep-batched-evaluations"
+evaluations = 16
+batch_size = 16
