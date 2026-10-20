@@ -60,6 +60,45 @@ def _series_label(result: dict[str, Any], x_field: str) -> str:
     return ", ".join(parts)
 
 
+def _scaling_series_key(result: dict[str, Any]) -> str:
+    config = dict(result["configuration"])
+    workers = config.pop("workers")
+    if config.get("scaling", "strong") == "weak":
+        config["evaluations"] //= workers
+        config["batch_size"] //= workers
+    commit = result.get("software", {}).get("chemfit_git", {}).get("commit")
+    return json.dumps((config, commit), sort_keys=True)
+
+
+def _derive_scaling_metrics(results: list[dict[str, Any]]) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for result in results:
+        grouped[_scaling_series_key(result)].append(result)
+
+    for series in grouped.values():
+        metric = (
+            "weak_scaling_efficiency"
+            if series[0]["configuration"].get("scaling", "strong") == "weak"
+            else "speedup"
+        )
+        if all(metric in result["metrics"] for result in series):
+            continue
+        reference_workers = min(result["configuration"]["workers"] for result in series)
+        reference_runtime = statistics.median(
+            result["metrics"]["median_runtime_seconds"]
+            for result in series
+            if result["configuration"]["workers"] == reference_workers
+        )
+        for result in series:
+            runtime_ratio = reference_runtime / result["metrics"]["median_runtime_seconds"]
+            if metric == "weak_scaling_efficiency":
+                result["metrics"][metric] = runtime_ratio
+            else:
+                worker_ratio = result["configuration"]["workers"] / reference_workers
+                result["metrics"]["speedup"] = runtime_ratio
+                result["metrics"]["parallel_efficiency"] = runtime_ratio / worker_ratio
+
+
 def _plot(
     results: list[dict[str, Any]],
     output: Path,
@@ -77,9 +116,7 @@ def _plot(
     if not metric_results:
         return
 
-    grouped: dict[str, dict[float, list[dict[str, Any]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
+    grouped: dict[str, dict[float, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for result in metric_results:
         config = result["configuration"]
         grouped[_series_label(result, x_field)][float(config[x_field])].append(result)
@@ -91,8 +128,7 @@ def _plot(
         if runtime_errors:
             errors = [
                 statistics.median(
-                    item["timings"]["median_absolute_deviation_seconds"]
-                    for item in points[x]
+                    item["timings"]["median_absolute_deviation_seconds"] for item in points[x]
                 )
                 for x in xs
             ]
@@ -107,7 +143,14 @@ def _plot(
         # Include every observed x coordinate so the reference follows ideal
         # linear speedup at each worker count.
         ideal_xs = sorted(set(all_xs))
-        ax.plot(ideal_xs, ideal_xs, "k--", linewidth=1, label="ideal")
+        reference_x = min(ideal_xs)
+        ax.plot(
+            ideal_xs,
+            [value / reference_x for value in ideal_xs],
+            "k--",
+            linewidth=1,
+            label="ideal",
+        )
     elif ideal == "unity":
         ax.axhline(1.0, color="black", linestyle="--", linewidth=1, label="ideal")
 
@@ -138,6 +181,7 @@ def _plot(
 def make_plots(results: list[dict[str, Any]], output: Path) -> None:
     if not results:
         raise ValueError("no JSON results found")
+    _derive_scaling_metrics(results)
     output.mkdir(parents=True, exist_ok=True)
     _plot(
         results,
@@ -154,7 +198,7 @@ def make_plots(results: list[dict[str, Any]], output: Path) -> None:
         filename="speedup_vs_workers.png",
         x_field="workers",
         metric="speedup",
-        ylabel="Speedup",
+        ylabel="Speedup relative to smallest worker count",
         ideal="linear",
     )
     _plot(
@@ -163,7 +207,7 @@ def make_plots(results: list[dict[str, Any]], output: Path) -> None:
         filename="efficiency_vs_workers.png",
         x_field="workers",
         metric="parallel_efficiency",
-        ylabel="Parallel efficiency",
+        ylabel="Parallel efficiency relative to smallest worker count",
         ideal="unity",
     )
     _plot(

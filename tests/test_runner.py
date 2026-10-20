@@ -59,13 +59,11 @@ def test_evaluate_many_result_validation(backend: str, task_kind: str) -> None:
         assert math.isclose(float(result.value), expected)
 
 
-def test_thread_run_has_repeats_and_single_worker_reference() -> None:
+def test_thread_run_has_repeats_without_reference_run() -> None:
     config = make_config(backend="thread", workers=2)
-    target, baseline = runner.run(config)
+    target = runner.run(config)
     assert target is not None
-    assert baseline is not None
     assert len(target["samples_seconds"]) == 2
-    assert len(baseline["samples_seconds"]) == 2
     assert target["evaluations_per_second"] > 0
     assert "first_evaluation_seconds" in target
     assert "measured_startup_overhead_seconds" in target
@@ -159,8 +157,6 @@ name = "weak-scaling"
     assert [config.evaluations for config in configs] == [2, 4, 8]
     assert [config.batch_size for config in configs] == [1, 2, 4]
     assert all(config.scaling == "weak" for config in configs)
-    assert all(runner._reference_config(config).evaluations == 2 for config in configs)
-    assert all(runner._reference_config(config).batch_size == 1 for config in configs)
 
 
 def test_weak_scaling_rejects_uncoupled_workload() -> None:
@@ -210,7 +206,7 @@ def test_json_result_contains_raw_samples_and_is_exclusively_created(
         "schedule_preparation_seconds": 0.002,
         "measured_startup_overhead_seconds": 0.003,
     }
-    result = runner.build_result(config, measurements, measurements)
+    result = runner.build_result(config, measurements)
     first = runner.write_result(result, tmp_path)
     second = runner.write_result(result, tmp_path)
     assert first != second
@@ -219,9 +215,10 @@ def test_json_result_contains_raw_samples_and_is_exclusively_created(
     assert stored["configuration"]["components"] == 3
     assert stored["configuration"]["graph_depth"] == 1
     assert stored["software"]["chemfit_git"]["commit"]
+    assert "single_worker_reference" not in stored
 
 
-def test_weak_scaling_result_has_weak_efficiency() -> None:
+def test_result_contains_only_directly_measured_metrics() -> None:
     config = make_config(
         scaling="weak",
         workers=4,
@@ -233,18 +230,10 @@ def test_weak_scaling_result_has_weak_efficiency() -> None:
         "evaluations_per_second": 8 / 1.25,
         "objective_terms_per_second": 24 / 1.25,
     }
-    baseline = {
-        "median_seconds": 1.0,
-        "evaluations_per_second": 2.0,
-        "objective_terms_per_second": 6.0,
-    }
+    result = runner.build_result(config, target)
 
-    result = runner.build_result(config, target, baseline)
-
-    assert result["metrics"]["weak_scaling_efficiency"] == pytest.approx(0.8)
+    assert result["metrics"]["median_runtime_seconds"] == 1.25
     assert "speedup" not in result["metrics"]
     assert "parallel_efficiency" not in result["metrics"]
-    reference = result["single_worker_reference_configuration"]
-    assert reference["workers"] == 1
-    assert reference["evaluations"] == 2
-    assert reference["batch_size"] == 2
+    assert "weak_scaling_efficiency" not in result["metrics"]
+    assert "single_worker_reference" not in result

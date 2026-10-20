@@ -517,15 +517,11 @@ replaced. Each record contains:
 
 - the complete configuration and worker count;
 - every timing sample, median, median absolute deviation, and throughput;
-- a matching one-worker reference and its configuration;
-- speedup and parallel efficiency for strong mode, or weak-scaling efficiency
-  for weak mode;
 - the ChemFit version and Git commit, including dirty-tree state;
 - Python, host, operating-system, CPU-count, and available Slurm metadata.
 
-For multi-worker configurations, the runner measures a matching one-worker
-reference in the same invocation. A strong reference runs the complete fixed
-workload, while a weak reference runs one worker's share. Scheduler
+Each configuration executes only the requested worker count; the runner does
+not perform an additional one-worker reference measurement. Scheduler
 construction and schedule preparation are recorded as measured startup
 overhead. The separately named
 `first_evaluation_seconds` includes useful task time and any lazy worker
@@ -549,8 +545,6 @@ For deep graphs, focus on:
 - `configuration.graph_depth`, `components`, `evaluations`, and `batch_size`;
 - `timings.samples_seconds` and `timings.median_seconds`;
 - `timings.objective_terms_per_second`, which includes terms from every layer;
-- `metrics.speedup` and `metrics.parallel_efficiency`, calculated from a
-  matching one-worker measurement in the same invocation;
 - `timings.first_evaluation_seconds`, which contains one real evaluation and
   possible lazy initialization and therefore is not pure startup overhead.
 
@@ -574,13 +568,15 @@ python plot_results.py results/deep-local --output plots/deep-local
 The script recursively reads JSON files and writes PNG and PDF versions of:
 
 - runtime versus worker count, with timing MAD error bars;
-- speedup versus worker count, with ideal linear scaling;
-- parallel efficiency versus worker count;
+- speedup relative to the smallest measured worker count, with ideal scaling;
+- parallel efficiency relative to the smallest measured worker count;
 - weak-scaling efficiency versus worker count, when weak results are present;
 - evaluation throughput versus atomic task duration.
 
 Results with the same configuration, ChemFit commit, and x coordinate are
 combined by their median for plotting. The original run files remain intact.
+Scaling metrics are derived in memory from the smallest worker count in each
+series, so plotting adds no benchmark work and does not alter result files.
 Graph depth appears in each series label, so a focused deep sweep produces one
 worker-scaling curve per depth for both the single and batched cases.
 
@@ -714,8 +710,7 @@ The script launches exactly one `srun` step. For each configuration, global
 rank 0 and the requested workers form an active communicator. Extra allocated
 ranks wait while smaller worker-count points run. Rank 0 drives
 `evaluate_many()`, worker ranks stay in `worker_loop()`, and closing the
-prepared schedule releases the workers before the next point. The matching
-one-worker reference is also measured inside the same allocation.
+prepared schedule releases the workers before the next point.
 
 ### 5. Select configuration and output through environment variables
 

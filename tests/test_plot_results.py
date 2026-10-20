@@ -87,3 +87,33 @@ def test_weak_scaling_points_share_one_series(tmp_path: Path) -> None:
     assert series_call.args[:2] == ([1.0, 2.0, 4.0, 8.0], [1.0, 1.0, 1.0, 1.0])
     assert "evals/worker=1" in series_call.kwargs["label"]
     axes.set_xlabel.assert_called_once_with("Worker threads")
+
+
+def test_scaling_metrics_use_smallest_measured_worker_count() -> None:
+    results = [
+        {
+            "configuration": {
+                "name": "scaling",
+                "backend": "mpi",
+                "task_kind": "busy",
+                "task_duration": 0.1,
+                "components": 1024,
+                "graph_depth": 1,
+                "evaluations": 32,
+                "batch_size": 32,
+                "workers": workers,
+                "scaling": "strong",
+            },
+            "metrics": {"median_runtime_seconds": runtime},
+        }
+        for workers, runtime in ((144, 20.0), (288, 10.0), (576, 5.0))
+    ]
+
+    plot_results._derive_scaling_metrics(results)
+
+    assert [result["metrics"]["speedup"] for result in results] == [1.0, 2.0, 4.0]
+    assert [result["metrics"]["parallel_efficiency"] for result in results] == [
+        1.0,
+        1.0,
+        1.0,
+    ]

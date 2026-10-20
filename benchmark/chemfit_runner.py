@@ -20,7 +20,7 @@ import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -123,10 +123,7 @@ def make_objective(config: BenchmarkConfig):
 
 
 def _inputs(count: int, sequence: int) -> list[dict[str, float]]:
-    return [
-        {"x": 1.0 + sequence / 1000.0 + index / max(count, 1)}
-        for index in range(count)
-    ]
+    return [{"x": 1.0 + sequence / 1000.0 + index / max(count, 1)} for index in range(count)]
 
 
 def evaluate_many_checked(
@@ -138,9 +135,7 @@ def evaluate_many_checked(
 ) -> float:
     """Time checked batches through ``PreparedSchedule.evaluate_many()``."""
     inputs = _inputs(count, sequence)
-    requests = [
-        chemfit.EvaluationRequest(value, chemfit.EvaluateContext()) for value in inputs
-    ]
+    requests = [chemfit.EvaluationRequest(value, chemfit.EvaluateContext()) for value in inputs]
     values: list[Any] = [None] * count
     completed: set[int] = set()
 
@@ -175,9 +170,7 @@ def evaluate_many_checked(
 def _measure_coordinator(schedule: Any, config: BenchmarkConfig) -> dict[str, Any]:
     # This includes useful work and any lazy worker initialization, so it is
     # intentionally not reported as pure worker-startup time.
-    first_evaluation_seconds = evaluate_many_checked(
-        schedule, config, count=1, sequence=-2
-    )
+    first_evaluation_seconds = evaluate_many_checked(schedule, config, count=1, sequence=-2)
     warmup_started = time.perf_counter()
     if config.warmup_evaluations:
         evaluate_many_checked(
@@ -269,25 +262,11 @@ def _run_mpi_communicator(config: BenchmarkConfig, comm: Any) -> dict[str, Any] 
     return result
 
 
-def _reference_config(config: BenchmarkConfig) -> BenchmarkConfig:
-    """Return the one-worker workload appropriate for the scaling mode."""
-    if config.scaling == "weak":
-        return replace(
-            config,
-            workers=1,
-            evaluations=config.evaluations // config.workers,
-            batch_size=config.batch_size // config.workers,
-        )
-    return replace(config, workers=1)
-
-
-def run(config: BenchmarkConfig) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Return a target and a matching one-worker reference measurement."""
+def run(config: BenchmarkConfig) -> dict[str, Any] | None:
+    """Run one configured benchmark point."""
     config.validate()
     if config.backend != "mpi":
-        target = _run_local(config)
-        baseline = target if config.workers == 1 else _run_local(_reference_config(config))
-        return target, baseline
+        return _run_local(config)
 
     from mpi4py import MPI
 
@@ -306,25 +285,11 @@ def run(config: BenchmarkConfig) -> tuple[dict[str, Any] | None, dict[str, Any] 
         world.Get_rank(),
     )
     target = None
-    baseline = None
     if active_comm != MPI.COMM_NULL:
-        if config.workers > 1:
-            baseline_comm = active_comm.Split(
-                0 if active_comm.Get_rank() < 2 else MPI.UNDEFINED,
-                active_comm.Get_rank(),
-            )
-            if baseline_comm != MPI.COMM_NULL:
-                baseline = _run_mpi_communicator(
-                    _reference_config(config), baseline_comm
-                )
-                baseline_comm.Free()
-            active_comm.Barrier()
         target = _run_mpi_communicator(config, active_comm)
-        if config.workers == 1:
-            baseline = target
         active_comm.Free()
     world.Barrier()
-    return target, baseline
+    return target
 
 
 def _git_info_for_module(module_file: str) -> dict[str, Any]:
@@ -446,11 +411,7 @@ def load_config(path: Path) -> SuiteConfig:
     tables = document.get("benchmark", [])
     if not tables:
         raise ValueError("configuration must contain at least one [[benchmark]] table")
-    benchmarks = [
-        config
-        for table in tables
-        for config in _expand_benchmark(defaults, table)
-    ]
+    benchmarks = [config for table in tables for config in _expand_benchmark(defaults, table)]
     return SuiteConfig(
         benchmarks=benchmarks,
         result_directory=Path(document.get("result_directory", "results")),
@@ -460,19 +421,12 @@ def load_config(path: Path) -> SuiteConfig:
 def build_result(
     config: BenchmarkConfig,
     target: dict[str, Any],
-    baseline: dict[str, Any],
 ) -> dict[str, Any]:
-    runtime_ratio = baseline["median_seconds"] / target["median_seconds"]
     metrics = {
         "median_runtime_seconds": target["median_seconds"],
         "throughput_evaluations_per_second": target["evaluations_per_second"],
         "throughput_objective_terms_per_second": target["objective_terms_per_second"],
     }
-    if config.scaling == "weak":
-        metrics["weak_scaling_efficiency"] = runtime_ratio
-    else:
-        metrics["speedup"] = runtime_ratio
-        metrics["parallel_efficiency"] = runtime_ratio / config.workers
 
     return {
         "schema_version": 1,
@@ -481,8 +435,6 @@ def build_result(
         "configuration": asdict(config),
         "worker_count": config.workers,
         "timings": target,
-        "single_worker_reference": baseline,
-        "single_worker_reference_configuration": asdict(_reference_config(config)),
         "metrics": metrics,
         **metadata(),
     }
@@ -583,11 +535,10 @@ def main() -> None:
         raise ValueError("MPI and local backends must use separate configuration files")
 
     for position, config in enumerate(configs, start=1):
-        target, baseline = run(config)
+        target = run(config)
         if target is None:
             continue
-        assert baseline is not None
-        result = build_result(config, target, baseline)
+        result = build_result(config, target)
         path = write_result(result, result_directory)
         print(
             f"[{position}/{len(configs)}] {config.name}: {config.backend}, "
