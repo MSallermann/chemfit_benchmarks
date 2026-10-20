@@ -40,6 +40,150 @@ python -m pip install -e ".[all]"
 
 The MPI extra is needed only for MPI runs. ChemFit itself is not modified.
 
+## Synthetic throughput microbenchmarks
+
+Two focused microbenchmarks complement the configurable workload runner. Use
+them when a full scaling campaign shows a throughput limit and you want to
+locate it more precisely:
+
+| Benchmark | What is timed | What is excluded |
+| --- | --- | --- |
+| [`coordinator_throughput.py`](benchmark/coordinator_throughput.py) | Graph bookkeeping, dependency release, completion draining, and result emission in `GraphScheduleBase.evaluate_many()` | Component execution, executor or MPI submission, serialization, and transport |
+| [`backend_throughput.py`](benchmark/backend_throughput.py) | Complete atomic evaluations through a real direct, serial-graph, thread-pool, process-pool, or MPI scheduling path | Scheduler construction, worker startup, and worker shutdown |
+
+Both scripts validate every case before measuring it, calibrate the number of
+iterations used in each sample, run warm-up samples, and report the median of
+the raw completion rates. They print a compact table by default and optionally
+write one self-describing JSON document containing the complete matrix. They
+do not use the TOML configurations or emit the per-configuration result schema
+used by `chemfit_runner.py` and `plot_results.py`.
+
+### Coordinator throughput
+
+Run a short smoke measurement with:
+
+```bash
+python benchmark/coordinator_throughput.py --quick \
+  --output coordinator-throughput.json
+```
+
+The benchmark uses an in-memory backend that turns every submitted node into
+an immediately available completion. The component bodies are never called.
+This makes the result a ceiling for the coordinator on the current Python and
+machine, not an estimate of thread-pool, process-pool, or MPI performance.
+
+A more targeted sweep looks like:
+
+```bash
+python benchmark/coordinator_throughput.py \
+  --shapes atomic,fanout,pipeline \
+  --batch-sizes 1,256,4096 \
+  --nodes-per-evaluation 1,8,64 \
+  --drain-sizes 1,8,all \
+  --samples 7 --target-seconds 0.5 \
+  --output coordinator-throughput.json
+```
+
+The axes have the following meanings:
+
+| Option | Meaning |
+| --- | --- |
+| `--shapes` | `atomic` is one node, `fanout` contains independent nodes, and `pipeline` contains sequentially dependent nodes. |
+| `--batch-sizes` | Number of concurrent top-level evaluations passed to one `evaluate_many()` call. |
+| `--nodes-per-evaluation` | Atomic nodes in each fan-out or pipeline. It is ignored for `atomic`, which always has one node. |
+| `--drain-sizes` | Maximum immediately available completions returned to the graph driver at once. `all` drains the complete available burst. |
+| `--samples` | Number of measured samples retained in the JSON output. |
+| `--warmups` | Number of untimed, calibrated warm-up samples. |
+| `--target-seconds` | Approximate target duration used to calibrate the iterations in one sample. |
+| `--max-iterations` | Upper bound on calibrated iterations per sample. |
+
+`fanout` and `pipeline` perform the same number of atomic completions but expose
+different dependency structure. Compare them to quantify dependency-release
+and frontier-refill costs. Varying `drain-size` shows the cost of processing
+completions individually versus in bursts. Large batches keep many graph
+instances active at once and show whether that fixed work amortizes.
+
+The primary metric is `median_completions_per_second`; its reciprocal is also
+reported as `median_nanoseconds_per_completion`. The JSON additionally records
+evaluation throughput, every sample duration and completion rate, the
+calibrated iteration count, and the median absolute deviation of completion
+rates. One evaluation contains `nodes_per_evaluation` completions, so compare
+completion throughput rather than evaluation throughput across different node
+counts.
+
+### End-to-end backend throughput
+
+Run a short local smoke measurement without the optional process-pool
+dependency:
+
+```bash
+python benchmark/backend_throughput.py --quick \
+  --backends direct,serial,threadpool \
+  --output backend-throughput.json
+```
+
+The benchmark sends an atomic component through the selected real scheduling
+path. The component can do no work, sleep, or busy-wait, and can return a byte
+payload of a controlled size. A useful local sweep is:
+
+```bash
+python benchmark/backend_throughput.py \
+  --backends direct,serial,threadpool,processpool \
+  --workers 1,4,12 \
+  --batch-sizes 1,12,768 \
+  --payload-sizes 0,1024 \
+  --work-times 0,0.001,0.01 \
+  --work-modes sleep,busy \
+  --output backend-throughput.json
+```
+
+The process-pool backend uses `loky`. Install ChemFit's `test` extra before
+selecting it; for the Git installation above, use `chemfit[mpi,test]` instead
+of `chemfit[mpi]`. The remaining axes are:
+
+| Option | Meaning |
+| --- | --- |
+| `--backends` | Any local combination of `direct`, `serial`, `threadpool`, and `processpool`, or `mpi` by itself. |
+| `--workers` | Worker counts for thread and process pools. Direct and serial always use one worker; MPI infers workers from the launched ranks. |
+| `--batch-sizes` | Number of concurrent atomic evaluations in each `evaluate_many()` call. |
+| `--payload-sizes` | Bytes carried in both the synthetic input and returned output. |
+| `--work-times` | Synthetic component duration in seconds. Zero selects one deduplicated `noop` case. |
+| `--work-modes` | For positive durations, `sleep` releases the GIL and `busy` runs a Python busy loop. |
+
+The measurement includes component invocation and the scheduling path used by
+the selected backend. For graph schedulers it also includes graph coordination
+and backend submission/completion handling; process-pool and MPI cases include
+the applicable serialization and transport. `direct` bypasses the graph and
+is a component-lifecycle baseline. As in the coordinator benchmark, the
+primary metric is median completions per second, with raw durations, rates,
+and rate MAD retained in JSON.
+
+Run MPI separately from all local backends. Rank 0 is the coordinator and all
+other ranks are workers, so this example records eight workers:
+
+```bash
+mpiexec -n 9 python benchmark/backend_throughput.py \
+  --backends mpi \
+  --batch-sizes 8,256 \
+  --payload-sizes 0,1024 \
+  --work-times 0,0.001 \
+  --output backend-throughput-mpi.json
+```
+
+Use no-op cases to expose fixed per-completion cost, payload sweeps to expose
+transport sensitivity, and positive work times to find where useful work
+amortizes scheduling overhead. Sleeping work is appropriate for thread
+concurrency; the Python busy loop holds the GIL, so do not interpret threaded
+busy-mode results as CPU parallel scaling.
+
+To relate the two microbenchmarks, compare the backend result with the
+coordinator's `atomic` shape at the same batch size. The coordinator number is
+the graph driver's in-memory ceiling. The gap to `serial`, `threadpool`,
+`processpool`, or `mpi` includes component and backend costs. Measurements are
+most useful when Python version, ChemFit commit, host, affinity, and MPI stack
+are held constant; the JSON records Python and platform information but not a
+ChemFit Git commit or cluster allocation metadata.
+
 ## Run one benchmark locally
 
 ```bash
