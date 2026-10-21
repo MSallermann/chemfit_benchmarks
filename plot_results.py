@@ -51,6 +51,13 @@ def _series_label(result: dict[str, Any], x_field: str) -> str:
                 f"batch={config['batch_size']}",
             )
         )
+    if config["backend"] == "mpi":
+        parts.extend(
+            (
+                f"message task cap={config.get('mpi_message_task_cap', 8)}",
+                f"target messages/worker={config.get('mpi_target_messages_per_worker', 8)}",
+            )
+        )
     if x_field != "workers":
         parts.append(f"workers={config['workers']}")
     if x_field != "task_duration":
@@ -63,6 +70,15 @@ def _series_label(result: dict[str, Any], x_field: str) -> str:
 def _scaling_series_key(result: dict[str, Any]) -> str:
     config = dict(result["configuration"])
     workers = config.pop("workers")
+    if config["backend"] == "mpi":
+        # Results written before these controls were configurable used the
+        # scheduler defaults, so normalize missing fields to those defaults.
+        config.setdefault("mpi_message_task_cap", 8)
+        config.setdefault("mpi_target_messages_per_worker", 8)
+    else:
+        # MPI batching settings have no effect on local schedulers.
+        config.pop("mpi_message_task_cap", None)
+        config.pop("mpi_target_messages_per_worker", None)
     if config.get("scaling", "strong") == "weak":
         config["evaluations"] //= workers
         config["batch_size"] //= workers

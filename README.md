@@ -50,8 +50,9 @@ locate it more precisely:
 | --- | --- | --- |
 | [`coordinator_throughput.py`](benchmark/coordinator_throughput.py) | Graph bookkeeping, dependency release, completion draining, and result emission in `GraphScheduleBase.evaluate_many()` | Component execution, executor or MPI submission, serialization, and transport |
 | [`backend_throughput.py`](benchmark/backend_throughput.py) | Complete atomic evaluations through a real direct, serial-graph, thread-pool, process-pool, or MPI scheduling path | Scheduler construction, worker startup, and worker shutdown |
+| [`scheduling_latency.py`](benchmark/scheduling_latency.py) | Worker-local execution intervals, same-worker gaps, utilization, and completion throughput | Scheduler construction and shutdown; startup is removed with configurable warmups |
 
-Both scripts validate every case before measuring it, calibrate the number of
+The two throughput scripts validate every case before measuring it, calibrate the number of
 iterations used in each sample, run warm-up samples, and report the median of
 the raw completion rates. They print a compact table by default and optionally
 write one self-describing JSON document containing the complete matrix. They
@@ -184,6 +185,100 @@ most useful when Python version, ChemFit commit, host, affinity, and MPI stack
 are held constant; the JSON records Python and platform information but not a
 ChemFit Git commit or cluster allocation metadata.
 
+### Scheduling latency and worker utilization
+
+Use the scheduling-latency benchmark when aggregate throughput alone does not
+explain a scaling limit. It instruments atomic components with ChemFit's public
+pre/post-evaluation hook API and records `time.perf_counter_ns()` immediately
+around component execution. Graph-scheduler atomic hooks execute in the thread,
+process, or MPI worker that runs the component. Direct scheduling executes them
+in the caller. Structural hooks execute on the graph coordinator, so this
+benchmark deliberately instruments only atomic leaves.
+
+A quick local smoke run is:
+
+```bash
+python benchmark/scheduling_latency.py --quick \
+  --output scheduling-latency.json
+```
+
+The `independent` shape runs one atomic component per top-level evaluation. The
+`graph` shape uses public `chemfit.join()` fan-out with the configured number of
+independent components in every evaluation. This example executes 32,000 graph
+components per sample:
+
+```bash
+python benchmark/scheduling_latency.py \
+  --backends serial,threadpool \
+  --workers 4,12 \
+  --shapes independent,graph \
+  --batch-sizes 32 \
+  --components 1000 \
+  --work-times 0.1 --work-modes sleep \
+  --samples 5 --warmups 1 \
+  --compare-uninstrumented \
+  --output scheduling-latency-local.json
+```
+
+Run MPI separately. Rank zero is the coordinator, so this example measures
+1,024 workers:
+
+```bash
+mpiexec -n 1025 python benchmark/scheduling_latency.py \
+  --backends mpi \
+  --shapes graph \
+  --batch-sizes 32 \
+  --components 1000 \
+  --work-times 0,0.01,0.1 --work-modes busy \
+  --samples 5 --warmups 1 \
+  --output scheduling-latency-mpi-1024.json
+```
+
+Launch separate jobs with 257, 513, 1,025, and 2,049 ranks to measure roughly
+256, 512, 1,024, and 2,048 workers. Worker count always comes from the MPI
+communicator. `--payload-sizes` controls bytes returned through each component,
+and `--include-traces` optionally retains every task identifier and timestamp.
+
+For consecutive executions on one worker, the benchmark reports the
+**inter-execution gap** from the previous post-hook timestamp to the next
+pre-hook timestamp. This is not pure MPI latency. It includes hook bookkeeping,
+serialization, transport, coordinator work, and waiting for more work. The JSON
+contains exact aggregate mean, median, p95, p99, and maximum gap statistics plus
+a bounded quantile sample for later distribution plots.
+
+Per-worker utilization is the sum of component execution intervals divided by
+the interval from that worker's first start to its last finish. Startup and
+shutdown are excluded, but load imbalance and the final drain are intentionally
+included. A steady-state value is emitted only when all active workers share a
+process clock, as with threads. Its window starts at the latest worker's first
+execution and ends at the earliest worker's last execution. MPI and process-pool
+steady-state values are omitted because clocks are not assumed synchronized.
+
+Hooks normally append records to process-local state. MPI ranks transfer their
+accumulated records once after worker shutdown rather than communicating per
+task. Public process-pool APIs cannot retrieve persistent worker-local hook
+objects, so process-pool measurements transport one compact record through
+`EvaluateContext.meta` per result. That overhead is identified in the JSON.
+Use `--compare-uninstrumented` to run a second schedule and quantify total
+instrumentation perturbation.
+
+The hook API does not expose MPI dispatch-batch identifiers. The benchmark
+therefore reports a combined gap distribution instead of inferring boundaries
+from arbitrary timing thresholds.
+
+Generate an interactive report with:
+
+```bash
+python benchmark/plot_scheduling_latency.py \
+  scheduling-latency-mpi-*.json \
+  --output scheduling-latency-report.html
+```
+
+The report compares utilization, median and p95 gaps, completion throughput,
+task-count distributions, and independent versus graph workloads. A throughput
+plateau with falling utilization or increasing gaps indicates worker starvation;
+high utilization with saturated throughput points elsewhere.
+
 ## Run one benchmark locally
 
 ```bash
@@ -221,9 +316,11 @@ A TOML file has shared defaults and one or more benchmark tables. Every
 benchmark field can be either a single value or a list, whether it appears in
 `[defaults]` or a `[[benchmark]]` table. This includes `name`, `backend`,
 `task_kind`, `task_duration`, `components`, `graph_depth`, `evaluations`,
-`batch_size`, `workers`, `repeats`, and `warmup_evaluations`. A list creates a
+`batch_size`, `workers`, `repeats`, `warmup_evaluations`,
+`mpi_message_task_cap`, and `mpi_target_messages_per_worker`. A list creates a
 Cartesian sweep; a single value stays fixed. `scaling` may be `strong` or
-`weak` and defaults to `strong`. The top-level `schema_version`
+`weak` and defaults to `strong`. The two MPI batching controls default to 8.
+The top-level `schema_version`
 and `result_directory` fields must be single values. Command-line arguments
 are also single-valued, so use a TOML file for sweeps:
 
@@ -264,11 +361,25 @@ The configuration fields have deliberately narrow meanings:
 | `warmup_evaluations` | Untimed evaluations after first use and before samples are collected. |
 | `repeats` | Number of raw timing samples retained in the JSON result. |
 | `scaling` | `strong` keeps the configured workload fixed. `weak` treats `evaluations` and `batch_size` as per-worker values and scales both by `workers`. |
+| `mpi_message_task_cap` | Maximum number of atomic tasks in one MPI message. Defaults to 8 tasks/message. |
+| `mpi_target_messages_per_worker` | Target number of MPI task messages sent to each worker for a ready-work cohort. Defaults to 8 messages/worker; lower values produce larger messages. |
 
 Lists are expanded independently. For example, four worker counts and three
 depths produce twelve configurations. There is no pairing or zip behavior.
 Keep MPI and local backends in separate files because MPI launches every
 Python process under the same communicator.
+
+For example, this compares approximately two versus four messages per worker,
+with at most 16 atomic tasks in each message:
+
+```toml
+[defaults]
+mpi_message_task_cap = 16
+mpi_target_messages_per_worker = [2, 4]
+```
+
+These controls are also available for single command-line runs as
+`--mpi-message-task-cap` and `--mpi-target-messages-per-worker`.
 
 ## Benchmark case catalog
 

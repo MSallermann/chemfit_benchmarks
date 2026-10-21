@@ -125,6 +125,100 @@ workers = [1, 2, 4]
     assert [config.workers for config in suite.benchmarks] == [1, 2, 4]
     assert {config.graph_depth for config in suite.benchmarks} == {1}
     assert {config.scaling for config in suite.benchmarks} == {"strong"}
+    assert {config.mpi_message_task_cap for config in suite.benchmarks} == {8}
+    assert {config.mpi_target_messages_per_worker for config in suite.benchmarks} == {8}
+
+
+def test_toml_expands_mpi_batching_settings(tmp_path: Path) -> None:
+    path = tmp_path / "mpi-batching.toml"
+    path.write_text(
+        """
+schema_version = 1
+
+[defaults]
+backend = "mpi"
+task_kind = "busy"
+task_duration = 0.1
+components = 1024
+evaluations = 32
+batch_size = 32
+workers = 1008
+repeats = 3
+warmup_evaluations = 1
+mpi_message_task_cap = 16
+mpi_target_messages_per_worker = [2, 4]
+
+[[benchmark]]
+name = "mpi-batching"
+""",
+        encoding="utf-8",
+    )
+
+    configs = runner.load_config(path).benchmarks
+
+    assert len(configs) == 2
+    assert {config.mpi_message_task_cap for config in configs} == {16}
+    assert {config.mpi_target_messages_per_worker for config in configs} == {2, 4}
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("mpi_message_task_cap", 0),
+        ("mpi_message_task_cap", 1.5),
+        ("mpi_target_messages_per_worker", 0),
+        ("mpi_target_messages_per_worker", 1.5),
+    ],
+)
+def test_mpi_batching_settings_must_be_positive_integers(
+    field_name: str,
+    value: object,
+) -> None:
+    config = make_config(**{field_name: value})
+
+    with pytest.raises(ValueError, match=f"{field_name} must be a positive integer"):
+        config.validate()
+
+
+def test_mpi_batching_settings_are_passed_to_scheduler(monkeypatch) -> None:
+    from chemfit import mpi_graph_schedule
+
+    received: dict[str, object] = {}
+
+    class Schedule:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    class Scheduler:
+        def __init__(self, **kwargs):
+            received.update(kwargs)
+
+        def prepare(self, objective):
+            return Schedule()
+
+    class Comm:
+        def Get_rank(self):
+            return 0
+
+        def Barrier(self):
+            return None
+
+    monkeypatch.setattr(mpi_graph_schedule, "MPIGraphScheduler", Scheduler)
+    monkeypatch.setattr(runner, "_measure_coordinator", lambda schedule, config: {})
+    config = make_config(
+        backend="mpi",
+        workers=4,
+        mpi_message_task_cap=16,
+        mpi_target_messages_per_worker=2,
+    )
+
+    runner._run_mpi_communicator(config, Comm())
+
+    assert received["max_tasks_per_message"] == 16
+    assert received["target_batches_per_worker"] == 2
 
 
 def test_weak_scaling_expands_per_worker_workload(tmp_path: Path) -> None:
@@ -214,6 +308,8 @@ def test_json_result_contains_raw_samples_and_is_exclusively_created(
     assert stored["timings"]["samples_seconds"] == [1.0, 1.1]
     assert stored["configuration"]["components"] == 3
     assert stored["configuration"]["graph_depth"] == 1
+    assert stored["configuration"]["mpi_message_task_cap"] == 8
+    assert stored["configuration"]["mpi_target_messages_per_worker"] == 8
     assert stored["software"]["chemfit_git"]["commit"]
     assert "single_worker_reference" not in stored
 

@@ -117,3 +117,45 @@ def test_scaling_metrics_use_smallest_measured_worker_count() -> None:
         1.0,
         1.0,
     ]
+
+
+def test_mpi_batching_settings_identify_plot_series() -> None:
+    base = {
+        "name": "scaling",
+        "backend": "mpi",
+        "task_kind": "busy",
+        "task_duration": 0.1,
+        "components": 1024,
+        "graph_depth": 1,
+        "evaluations": 32,
+        "batch_size": 32,
+        "workers": 1008,
+        "scaling": "strong",
+    }
+    legacy = {"configuration": dict(base), "metrics": {}}
+    defaults = {
+        "configuration": {
+            **base,
+            "mpi_message_task_cap": 8,
+            "mpi_target_messages_per_worker": 8,
+        },
+        "metrics": {},
+    }
+    tuned = {
+        "configuration": {
+            **base,
+            "mpi_message_task_cap": 16,
+            "mpi_target_messages_per_worker": 2,
+        },
+        "metrics": {},
+    }
+
+    assert plot_results._scaling_series_key(legacy) == plot_results._scaling_series_key(
+        defaults
+    )
+    assert plot_results._scaling_series_key(tuned) != plot_results._scaling_series_key(
+        defaults
+    )
+    label = plot_results._series_label(tuned, "workers")
+    assert "message task cap=16" in label
+    assert "target messages/worker=2" in label

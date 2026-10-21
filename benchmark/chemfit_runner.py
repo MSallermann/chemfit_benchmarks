@@ -47,6 +47,8 @@ class BenchmarkConfig:
     warmup_evaluations: int
     graph_depth: int = 1
     scaling: str = "strong"
+    mpi_message_task_cap: int = 8
+    mpi_target_messages_per_worker: int = 8
 
     def validate(self) -> None:
         if not self.name:
@@ -66,6 +68,10 @@ class BenchmarkConfig:
             raise ValueError("warmup_evaluations cannot be negative")
         if self.graph_depth < 1:
             raise ValueError("graph_depth must be positive")
+        for field_name in ("mpi_message_task_cap", "mpi_target_messages_per_worker"):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
         if self.scaling == "weak" and (
             self.evaluations % self.workers or self.batch_size % self.workers
         ):
@@ -241,7 +247,12 @@ def _run_mpi_communicator(config: BenchmarkConfig, comm: Any) -> dict[str, Any] 
 
     objective = make_objective(config)
     construction_started = time.perf_counter()
-    scheduler = MPIGraphScheduler(comm=comm, mpi_debug_log=False)
+    scheduler = MPIGraphScheduler(
+        comm=comm,
+        max_tasks_per_message=config.mpi_message_task_cap,
+        target_batches_per_worker=config.mpi_target_messages_per_worker,
+        mpi_debug_log=False,
+    )
     scheduler_construction_seconds = time.perf_counter() - construction_started
     preparation_started = time.perf_counter()
     schedule = scheduler.prepare(objective)
@@ -403,6 +414,8 @@ def load_config(path: Path) -> SuiteConfig:
     defaults = {
         "graph_depth": 1,
         "scaling": "strong",
+        "mpi_message_task_cap": 8,
+        "mpi_target_messages_per_worker": 8,
         **document.get("defaults", {}),
     }
     unknown_defaults = set(defaults) - _CONFIG_FIELDS
@@ -478,6 +491,8 @@ def _parse_args() -> tuple[list[BenchmarkConfig], Path]:
     parser.add_argument("--warmup-evaluations", type=int, default=2)
     parser.add_argument("--graph-depth", type=int)
     parser.add_argument("--scaling", choices=("strong", "weak"))
+    parser.add_argument("--mpi-message-task-cap", type=int)
+    parser.add_argument("--mpi-target-messages-per-worker", type=int)
     args = parser.parse_args()
 
     direct_names = (
@@ -490,6 +505,8 @@ def _parse_args() -> tuple[list[BenchmarkConfig], Path]:
         "workers",
         "graph_depth",
         "scaling",
+        "mpi_message_task_cap",
+        "mpi_target_messages_per_worker",
     )
     supplied_directly = any(getattr(args, name) is not None for name in direct_names)
     if args.config:
@@ -499,7 +516,15 @@ def _parse_args() -> tuple[list[BenchmarkConfig], Path]:
         return suite.benchmarks, args.results_dir or suite.result_directory
 
     required_direct_names = tuple(
-        name for name in direct_names if name not in {"graph_depth", "scaling"}
+        name
+        for name in direct_names
+        if name
+        not in {
+            "graph_depth",
+            "scaling",
+            "mpi_message_task_cap",
+            "mpi_target_messages_per_worker",
+        }
     )
     missing = [name for name in required_direct_names if getattr(args, name) is None]
     if missing:
@@ -517,6 +542,14 @@ def _parse_args() -> tuple[list[BenchmarkConfig], Path]:
         "warmup_evaluations": args.warmup_evaluations,
         "graph_depth": 1 if args.graph_depth is None else args.graph_depth,
         "scaling": "strong" if args.scaling is None else args.scaling,
+        "mpi_message_task_cap": (
+            8 if args.mpi_message_task_cap is None else args.mpi_message_task_cap
+        ),
+        "mpi_target_messages_per_worker": (
+            8
+            if args.mpi_target_messages_per_worker is None
+            else args.mpi_target_messages_per_worker
+        ),
     }
     if config_values["scaling"] == "weak":
         config_values["evaluations"] *= config_values["workers"]
